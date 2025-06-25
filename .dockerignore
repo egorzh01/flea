@@ -1,0 +1,16 @@
+data
+.git
+__pycache__
+*.pyc
+.env
+tests
+.vscode
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+.gitignore
+.gitlab-ci.yml
+Makefile
+README.md
+.venv
