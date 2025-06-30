@@ -20,7 +20,10 @@ class Session(Base):
     )
 
     refresh_token: Mapped[str] = mapped_column(
-        comment="Session ID",
+        comment="Refresh token",
+    )
+    csrf_token: Mapped[str] = mapped_column(
+        comment="CSRF token",
     )
     user_uid: Mapped[int] = mapped_column(
         ForeignKey(

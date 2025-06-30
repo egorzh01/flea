@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = 5433
     POSTGRES_USER: str = "postgres"
     POSTGRES_PASSWORD: str = "postgres"
-    POSTGRES_DB: str = "docsbox"
+    POSTGRES_DB: str = "flea-db"
 
     SECRET_KEY: str = "secret"
 
