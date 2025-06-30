@@ -1,12 +1,15 @@
+import secrets
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
-import bcrypt
 import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 from fastapi import HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from jwt.exceptions import InvalidTokenError
 from pydantic import IPvAnyAddress, ValidationError
-from sqlalchemy import delete, exists, select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -19,12 +22,23 @@ from app.schemas.auth import (
     TokensDTO,
 )
 
+ph = PasswordHasher()
+
+
 JWT_ALGORITHM = "HS256"
 
-INCORRECT_CREDENTIALS_HTTP_EXCEPTION = HTTPException(
-    status_code=status.HTTP_401_UNAUTHORIZED,
-    detail="Incorrect credentials",
+INVALID_CREDENTIALS_HTTP_EXCEPTION = HTTPException(
+    status_code=status.HTTP_400_BAD_REQUEST,
+    detail={"msg": "Invalid credentials", "code": "INVALID_CREDENTIALS"},
 )
+
+CSRF_TOKEN_MISMATCH_HTTP_EXCEPTION = HTTPException(
+    status_code=status.HTTP_400_BAD_REQUEST,
+    detail="CSRF token mismatch",
+)
+
+REFRESH_COOKIE_KEY = "flea_refresh_token"
+CSRF_COOKIE_KEY = "flea_csrf_token"
 
 
 class AuthService:
@@ -46,10 +60,7 @@ class AuthService:
             )
         user = User(
             email=schema.email,
-            password=bcrypt.hashpw(
-                password=schema.password.encode("utf-8"),
-                salt=bcrypt.gensalt(),
-            ).decode("utf-8"),
+            password=ph.hash(schema.password),
         )
         self.db_session.add(user)
         await self.db_session.flush()
@@ -62,27 +73,39 @@ class AuthService:
         stmt = select(User).where(User.email == schema.username)
         user = await self.db_session.scalar(stmt)
         if not user:
-            raise INCORRECT_CREDENTIALS_HTTP_EXCEPTION
-        if not bcrypt.checkpw(
-            password=schema.password.encode("utf-8"),
-            hashed_password=user.password.encode("utf-8"),
-        ):
-            raise INCORRECT_CREDENTIALS_HTTP_EXCEPTION
+            raise INVALID_CREDENTIALS_HTTP_EXCEPTION
+        try:
+            ph.verify(
+                hash=user.password,
+                password=schema.password,
+            )
+        except VerifyMismatchError as exc:
+            raise INVALID_CREDENTIALS_HTTP_EXCEPTION from exc
         return user.uid
 
     async def refresh_token(
         self,
         refresh_token: str,
+        csrf_token_header: str,
     ) -> int:
-        self.decode_jwt_token(refresh_token)
+        payload = self.decode_jwt_token(refresh_token)
         session = await self.db_session.scalar(
-            select(Session).where(Session.refresh_token == refresh_token),
+            select(Session)
+            .where(Session.refresh_token == refresh_token)
+            .with_for_update(),
         )
         if not session:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session not found",
             )
+        if payload.user_uid != session.user_uid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid session",
+            )
+        if session.csrf_token != csrf_token_header:
+            raise CSRF_TOKEN_MISMATCH_HTTP_EXCEPTION
         await self.db_session.delete(session)
         return session.user_uid
 
@@ -96,6 +119,7 @@ class AuthService:
         )
         access_token = self.create_jwt_token(payload, timedelta(minutes=15))
         refresh_token = self.create_jwt_token(payload, timedelta(days=30))
+        csrf_token = secrets.token_urlsafe(32)
         x_forwarded_for = request.headers.get("x-forwarded-for")
         try:
             ip = IPvAnyAddress(  # type: ignore
@@ -108,10 +132,11 @@ class AuthService:
                 ).strip(),
             )
 
-        except Exception:
+        except ValidationError:
             ip = None
         session = Session(
             refresh_token=refresh_token,
+            csrf_token=csrf_token,
             user_uid=user_uid,
             ip=ip,
             user_agent=request.headers.get("user-agent"),
@@ -120,6 +145,7 @@ class AuthService:
         return TokensDTO(
             access_token=access_token,
             refresh_token=refresh_token,
+            csrf_token=csrf_token,
         )
 
     @classmethod
@@ -129,11 +155,18 @@ class AuthService:
         response: Response,
     ) -> TokenSchema:
         response.set_cookie(
-            key="flea_refresh_token",
+            key=REFRESH_COOKIE_KEY,
             value=tokens.refresh_token,
             httponly=True,
-            samesite="strict",
+              samesite="lax",
             path="/api/auth/refresh_token/",
+        )
+        response.set_cookie(
+            key=CSRF_COOKIE_KEY,
+            value=tokens.csrf_token,
+            httponly=False,
+            samesite="lax",
+            path="/",
         )
         return TokenSchema(
             access_token=tokens.access_token,
@@ -166,6 +199,7 @@ class AuthService:
             payload={
                 "exp": datetime.now(UTC) + exp,
                 **payload.model_dump(by_alias=True),
+                "jti": str(uuid4()),
             },
             key=settings.SECRET_KEY,
             algorithm=JWT_ALGORITHM,
@@ -175,11 +209,34 @@ class AuthService:
         self,
         response: Response,
         refresh_token: str,
+        csrf_token_header: str,
     ) -> None:
-        await self.db_session.execute(
-            delete(Session).where(Session.refresh_token == refresh_token),
+        session = await self.db_session.scalar(
+            select(Session).where(Session.refresh_token == refresh_token),
         )
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session not found",
+            )
+        if session.csrf_token != csrf_token_header:
+            raise CSRF_TOKEN_MISMATCH_HTTP_EXCEPTION
+        await self.db_session.delete(session)
         response.delete_cookie(
-            key="docsbox_refresh_token",
+            key=REFRESH_COOKIE_KEY,
             path="/api/auth/refresh_token/",
         )
+
+    @staticmethod
+    def initial_check_tokens(
+        refresh_token: str,
+        csrf_token_header: str,
+        csrf_token_cookie: str,
+    ) -> None:
+        if not refresh_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token not found",
+            )
+        if csrf_token_header and csrf_token_cookie != csrf_token_header:
+            raise CSRF_TOKEN_MISMATCH_HTTP_EXCEPTION

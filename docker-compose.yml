@@ -15,8 +15,8 @@ services:
       migrator:
         condition: service_completed_successfully
     volumes:
-      - ./app:/docsbox-backend/app
-      - ./data/files/:/docsbox-backend/data/files/
+      - ./app:/flea/app
+      - ./data/files/:/flea/data/files/
 
   migrator:
     <<: *main

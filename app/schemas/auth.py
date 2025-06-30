@@ -1,14 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field
 
-# class LoginSchema(BaseModel):
-#     email: EmailStr = Field(
-#         title="User email",
-#     )
-#     password: str = Field(
-#         max_length=64,
-#         title="User password",
-#     )
-
 
 class RegisterSchema(BaseModel):
     model_config = {
@@ -40,6 +31,9 @@ class TokenSchema(WithAccessTokenSchema):
 class TokensDTO(WithAccessTokenSchema):
     refresh_token: str = Field(
         title="Refresh token",
+    )
+    csrf_token: str = Field(
+        title="CSRF token",
     )
 
 
